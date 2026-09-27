@@ -92,7 +92,9 @@ if fs.exists(playlistFile) then
 end
 local function save()
   local f = fs.open(playlistFile, 'w')
-  if f then f.write(textutils.serializeJSON(playlist)); f.close() end
+  if not f then return false end
+  f.write(textutils.serializeJSON(playlist)); f.close()
+  return true
 end
 if initialURL and initialURL ~= '' then playlist[#playlist+1] = initialURL; save() end
 local selected = initialURL and #playlist or 1
@@ -271,6 +273,19 @@ local function control(action, value)
       save()
       status('Video adicionado a lista')
     else status('Link invalido ou vazio') end
+  elseif action=='add_url' then
+    if type(value)=='string' and #value<=1900 and value:match('^https?://[%w%.%-]+') then
+      playlist[#playlist+1]=value
+      selected=#playlist
+      if save() then
+        status('Musica adicionada a lista')
+        return true
+      end
+      table.remove(playlist)
+      selected=math.max(1,#playlist)
+    end
+    status('Nao foi possivel salvar o link')
+    return false
   elseif action=='delete' then
     if #playlist>0 then
       table.remove(playlist,selected)
@@ -381,7 +396,13 @@ local function remoteLoop()
         if message then
           local data=textutils.unserializeJSON(message)
           if type(data)=='table' and data.type=='control' then
-            control(data.action,data.value)
+            if data.action=='add_url' then
+              local saved, result=pcall(control,data.action,data.value)
+              if not pcall(ws.send,textutils.serializeJSON({type='add_ack',id=data.id,
+                  ok=saved and result==true})) then break end
+            else
+              control(data.action,data.value)
+            end
           end
         elseif reason and reason~='Timed out' then break end
       end

@@ -112,7 +112,7 @@ def convert(url, width, height, fps, folder, cancel):
     command = [sys.executable, '-m', 'yt_dlp', '--no-playlist',
          '--no-progress', '--no-warnings',
          '--match-filter', f'duration <=? {MAX_SECONDS} & !is_live',
-         '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b/bv*+ba/b',
+         '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b/bv*+ba/b/bestaudio/best',
          '--merge-output-format', 'mkv', '--print', 'before_dl:CC_TV_TITLE:%(title)s', '-o', str(folder / 'source.%(ext)s'), url]
     download = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors='replace')
@@ -141,35 +141,63 @@ def convert(url, width, height, fps, folder, cancel):
                   if line.startswith('CC_TV_TITLE:')), source.stem)[:120]
     if cancel.is_set():
         raise RuntimeError('Conversao cancelada.')
-    palette = sampled_palette(source, width, height)
-    cc_palette = make_palette(palette)
-    count = 0
-    frame_size = width * height * 3
-    cmd = ['ffmpeg', '-v', 'error', '-i', str(source), '-t', str(MAX_SECONDS),
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type',
+                            '-show_entries', 'format=duration', '-of', 'json', str(source)],
+                           capture_output=True, text=True, check=True)
+    media = json.loads(probe.stdout)
+    audio_only = not any(s.get('codec_type') == 'video' for s in media.get('streams', []))
+    if audio_only:
+        if not any(s.get('codec_type') == 'audio' for s in media.get('streams', [])):
+            raise RuntimeError('Arquivo sem video ou audio reproduzivel.')
+        try:
+            seconds = min(MAX_SECONDS, float(media['format']['duration']))
+        except (KeyError, ValueError, TypeError):
+            raise RuntimeError('Duracao da musica indisponivel.')
+        if not 0 < seconds <= MAX_SECONDS:
+            raise RuntimeError('Musica vazia ou acima do limite de 5 minutos.')
+        palette = PALETTE
+        count = min(fps * MAX_SECONDS, max(1, int(seconds * fps)))
+        bg = b'f' * (width * height)
+        with (folder / 'frames.bin').open('wb') as dst:
+            for i in range(count):
+                if cancel.is_set():
+                    raise RuntimeError('Conversao cancelada.')
+                frame = bytearray(bg)
+                for bar in range(4, width - 4, max(2, width // 36)):
+                    phase = (bar * 13 + i * 7) % 29
+                    magnitude = max(2, (height // 2) * (8 + abs(phase - 14)) // 22)
+                    for y in range(max(2, height // 2 - magnitude), min(height - 2, height // 2 + magnitude)):
+                        frame[y * width + bar] = ord('b' if y < height // 2 else '9')
+                dst.write(frame)
+    else:
+        palette = sampled_palette(source, width, height)
+        cc_palette = make_palette(palette)
+        count = 0
+        frame_size = width * height * 3
+        cmd = ['ffmpeg', '-v', 'error', '-i', str(source), '-t', str(MAX_SECONDS),
            '-vf', video_filter(width, height, fps),
            '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-an', '-']
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
-        with (folder / 'frames.bin').open('wb') as dst:
-            while count < fps * MAX_SECONDS:
-                if cancel.is_set():
-                    proc.terminate()
-                    break
-                frame = proc.stdout.read(frame_size)
-                if len(frame) != frame_size:
-                    break
-                img = Image.frombytes('RGB', (width, height), frame)
-                # Fast nearest-palette conversion; one ASCII nibble per pixel.
-                quant = img.quantize(palette=cc_palette, dither=Image.Dither.FLOYDSTEINBERG)
-                dst.write(bytes(HEX[min(i, 15)] for i in quant.tobytes()))
-                count += 1
-    finally:
-        proc.stdout.close()
-        proc.wait(timeout=20)
-    if cancel.is_set():
-        raise RuntimeError('Conversao cancelada.')
-    if proc.returncode != 0 or count == 0:
-        raise RuntimeError('FFmpeg nao conseguiu converter o video.')
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            with (folder / 'frames.bin').open('wb') as dst:
+                while count < fps * MAX_SECONDS:
+                    if cancel.is_set():
+                        proc.terminate()
+                        break
+                    frame = proc.stdout.read(frame_size)
+                    if len(frame) != frame_size:
+                        break
+                    img = Image.frombytes('RGB', (width, height), frame)
+                    quant = img.quantize(palette=cc_palette, dither=Image.Dither.FLOYDSTEINBERG)
+                    dst.write(bytes(HEX[min(i, 15)] for i in quant.tobytes()))
+                    count += 1
+        finally:
+            proc.stdout.close()
+            proc.wait(timeout=20)
+        if cancel.is_set():
+            raise RuntimeError('Conversao cancelada.')
+        if proc.returncode != 0 or count == 0:
+            raise RuntimeError('FFmpeg nao conseguiu converter o video.')
     audio = folder / 'audio.dfpwm'
     if cancel.is_set():
         raise RuntimeError('Conversao cancelada.')
@@ -211,6 +239,7 @@ SESSIONS = {}
 SESSION_TTL = 24 * 3600
 web_clients = set()
 tv_socket = None
+pending_add = {}
 last_tv_state = {'type': 'state', 'online': False, 'playing': False}
 
 
@@ -407,19 +436,50 @@ async def websocket_endpoint(websocket: WebSocket):
                     'volume': max(0, min(3, float(data.get('volume') or 0))),
                 }
                 await broadcast_state()
+            elif is_tv and data.get('type') == 'add_ack':
+                item = pending_add.get(data.get('id'))
+                if item and item[0] is websocket and not item[1].done():
+                    item[1].set_result(bool(data.get('ok')))
             elif is_browser and data.get('type') == 'control':
                 action = data.get('action')
-                if action not in ('play', 'pause', 'resume', 'stop', 'next', 'volume'):
+                if action not in ('play', 'pause', 'resume', 'stop', 'next', 'volume', 'add_url'):
                     continue
                 try:
                     value = max(0, min(3, float(data.get('value', 0)))) if action == 'volume' else None
                 except (ValueError, TypeError):
                     continue
+                if action == 'add_url':
+                    try:
+                        value = await asyncio.to_thread(validated_url, data.get('value'))
+                    except ValueError as ex:
+                        await websocket.send_json({'type': 'add_result', 'ok': False, 'message': str(ex)})
+                        continue
                 if tv_socket:
                     try:
-                        await tv_socket.send_json({'type': 'control', 'action': action, 'value': value})
+                        if action == 'add_url':
+                            target = tv_socket
+                            request_id = secrets.token_hex(12)
+                            acknowledged = asyncio.get_running_loop().create_future()
+                            pending_add[request_id] = (target, acknowledged)
+                            try:
+                                await target.send_json({'type': 'control', 'action': action,
+                                                        'value': value, 'id': request_id})
+                                saved = await asyncio.wait_for(acknowledged, timeout=12)
+                            except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
+                                saved = False
+                            finally:
+                                pending_add.pop(request_id, None)
+                            await websocket.send_json({'type': 'add_result', 'ok': saved,
+                                'message': 'Adicionado à lista do Minecraft.' if saved else
+                                'O Minecraft não confirmou o link. Reinicie tv.lua e tente novamente.'})
+                        else:
+                            await tv_socket.send_json({'type': 'control', 'action': action, 'value': value})
                     except Exception:
-                        pass
+                        if action == 'add_url':
+                            await websocket.send_json({'type': 'add_result', 'ok': False,
+                                'message': 'Falha ao enviar para a TV. Tente novamente.'})
+                elif action == 'add_url':
+                    await websocket.send_json({'type': 'add_result', 'ok': False, 'message': 'Abra o programa tv no Minecraft.'})
     except (WebSocketDisconnect, RuntimeError, ValueError, TypeError):
         pass
     finally:

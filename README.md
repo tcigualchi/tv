@@ -76,9 +76,11 @@ Para abrir sem video predefinido: `tv https://SUA_URL.ngrok-free.dev`.
 
 ## Controle web no celular ou PC
 
-Abra no navegador a mesma URL HTTPS do ngrok usada pelo `tv.lua`. A pagina `dashboard.html` mostra o video atual, o tempo de reproducao e o estado da TV. Digite a chave de acesso do servidor para entrar; a pagina oferece Play/Pause, Stop, Next e volume de 0% a 300%. A interface se ajusta a telas pequenas. Os videos aparecem apenas no monitor do Minecraft, e os links da lista continuam sendo adicionados pelo computador do jogo.
+Abra no navegador a mesma URL HTTPS do ngrok usada pelo `tv.lua`. A pagina `dashboard.html` mostra o video atual, o tempo de reproducao e o estado da TV. Digite a chave de acesso do servidor para entrar; a pagina oferece Play/Pause, Stop, Next, volume de 0% a 300% e um campo para adicionar links de musicas ou videos a lista do Minecraft. A interface se ajusta a telas pequenas. Os videos aparecem apenas no monitor do Minecraft. Links de audio sem video exibem barras animadas; para ouvir, conecte um speaker ao computador do jogo. Clique em Play para tocar o item selecionado apos adicionar; adicionar um link nao interrompe a musica em andamento.
 
 O `tv.lua` precisa permanecer aberto no computador do Minecraft. Atualize **juntos** `server.py`, `requirements.txt`, `dashboard.html` no Kali e `tv.lua` no computador do jogo: a interface usa WebSocket para receber o estado e enviar comandos. A sessao do navegador usa cookie seguro com duracao de 24 horas; a chave nao fica salva no JavaScript nem na URL.
+
+Ao adicionar um link pela pagina, a confirmacao aparece somente depois que o computador do Minecraft grava o item na lista. Se a TV nao confirmar em 12 segundos, o navegador mostrara uma falha e mantera o link no campo para nova tentativa. Nao repita o envio antes de conferir a lista caso haja demora na conexao.
 
 Se voce ja instalou o servico em `~/Downloads/cc-tv-youtube`, copie os tres arquivos novos do servidor da pasta extraida para **essa pasta ativa** e execute:
 
