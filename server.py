@@ -1,6 +1,8 @@
-"""Local YouTube -> CC:Tweaked frame/audio bridge. Python 3.10+."""
+"""Online video -> CC:Tweaked frame/audio bridge. Python 3.10+."""
 import argparse
 import json
+import ipaddress
+import socket
 import importlib.util
 import os
 import secrets
@@ -72,48 +74,67 @@ def sampled_palette(source, width, height):
 lock = threading.Lock()
 job = {'state': 'idle'}
 job_dir = None
+job_cancel = None
 ACCESS_TOKEN = os.environ.get('CC_TV_TOKEN') or secrets.token_urlsafe(24)
 
 
-def video_id(url):
-    p = urlparse(url)
-    host = (p.hostname or '').lower()
-    if p.scheme != 'https' or p.username or p.password or p.port:
-        raise ValueError('Use um link HTTPS normal do YouTube.')
-    if host in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
-        if p.path == '/watch':
-            value = parse_qs(p.query).get('v', [''])[0]
-        elif p.path.startswith('/shorts/') or p.path.startswith('/live/'):
-            value = p.path.split('/')[2]
-        else:
-            raise ValueError('Use um link de video, Shorts ou live gravada.')
-    elif host == 'youtu.be':
-        value = p.path.strip('/')
-    else:
-        raise ValueError('Apenas links do YouTube sao aceitos.')
-    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', value):
-        raise ValueError('ID de video invalido.')
-    return value
+def validated_url(url):
+    if not isinstance(url, str) or len(url) > 1900 or any(ord(c) < 32 for c in url):
+        raise ValueError('Link invalido ou longo demais.')
+    try:
+        p = urlparse(url)
+        host = p.hostname
+        port = p.port
+    except ValueError as ex:
+        raise ValueError('Link invalido.') from ex
+    if p.scheme not in ('http', 'https') or not host or p.username or p.password:
+        raise ValueError('Use um link HTTP ou HTTPS publico, sem login na URL.')
+    if port not in (None, 80, 443):
+        raise ValueError('Porta do link nao permitida.')
+    try:
+        addresses = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+            raise ValueError('Links para rede local nao sao permitidos.')
+    except socket.gaierror as ex:
+        raise ValueError('Dominio do link nao encontrado.') from ex
+    return url
 
 
 def run(cmd, **kwargs):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
 
 
-def convert(url, width, height, fps, folder):
+def convert(url, width, height, fps, folder, cancel):
     command = [sys.executable, '-m', 'yt_dlp', '--no-playlist',
          '--no-progress', '--no-warnings',
-         '--match-filter', f'duration <= {MAX_SECONDS} & !is_live',
-         '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b',
+         '--match-filter', f'duration <=? {MAX_SECONDS} & !is_live',
+         '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b/bv*+ba/b',
          '--merge-output-format', 'mkv', '-o', str(folder / 'source.%(ext)s'), url]
-    result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=600)
-    if result.returncode:
-        raise RuntimeError('yt-dlp: ' + (result.stderr or result.stdout)[-1200:])
-    candidates = [p for p in folder.glob('source.*') if p.suffix in ('.mkv', '.mp4', '.webm')]
+    download = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, errors='replace')
+    try:
+        while True:
+            try:
+                output, errors = download.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel.is_set():
+                    download.terminate()
+                    download.communicate()
+                    raise RuntimeError('Conversao cancelada.')
+    finally:
+        if download.poll() is None:
+            download.kill()
+            download.communicate()
+    if download.returncode:
+        raise RuntimeError('yt-dlp: ' + (errors or output)[-1200:])
+    candidates = [p for p in folder.glob('source.*') if p.is_file() and p.suffix not in ('.part', '.ytdl', '.json')]
     if not candidates:
-        detail = (result.stdout + '\n' + result.stderr).strip()[-1200:]
+        detail = (output + '\n' + errors).strip()[-1200:]
         raise RuntimeError('yt-dlp nao gerou video. ' + (detail or 'Verifique o link.'))
     source = candidates[0]
+    if cancel.is_set():
+        raise RuntimeError('Conversao cancelada.')
     palette = sampled_palette(source, width, height)
     cc_palette = make_palette(palette)
     count = 0
@@ -125,6 +146,9 @@ def convert(url, width, height, fps, folder):
     try:
         with (folder / 'frames.bin').open('wb') as dst:
             while count < fps * MAX_SECONDS:
+                if cancel.is_set():
+                    proc.terminate()
+                    break
                 frame = proc.stdout.read(frame_size)
                 if len(frame) != frame_size:
                     break
@@ -136,9 +160,13 @@ def convert(url, width, height, fps, folder):
     finally:
         proc.stdout.close()
         proc.wait(timeout=20)
+    if cancel.is_set():
+        raise RuntimeError('Conversao cancelada.')
     if proc.returncode != 0 or count == 0:
         raise RuntimeError('FFmpeg nao conseguiu converter o video.')
     audio = folder / 'audio.dfpwm'
+    if cancel.is_set():
+        raise RuntimeError('Conversao cancelada.')
     try:
         run(['ffmpeg', '-y', '-v', 'error', '-i', str(source), '-t', str(MAX_SECONDS),
              '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'dfpwm', '-f', 'dfpwm', str(audio)], timeout=240)
@@ -148,10 +176,10 @@ def convert(url, width, height, fps, folder):
     return count, audio.exists(), ['#%02x%02x%02x' % rgb for rgb in palette]
 
 
-def worker(generation, url, width, height, fps, folder):
+def worker(generation, url, width, height, fps, folder, cancel):
     global job_dir
     try:
-        count, has_audio, palette = convert(url, width, height, fps, folder)
+        count, has_audio, palette = convert(url, width, height, fps, folder, cancel)
         with lock:
             if job.get('generation') == generation:
                 job.update(state='ready', frames=count, audio=has_audio, palette=palette)
@@ -159,7 +187,8 @@ def worker(generation, url, width, height, fps, folder):
         detail = str(ex)
         if isinstance(ex, subprocess.CalledProcessError) and ex.stderr:
             detail = ex.stderr.decode('utf-8', errors='replace')[-700:]
-        print('Falha na conversao: ' + detail, flush=True)
+        if not cancel.is_set():
+            print('Falha na conversao: ' + detail, flush=True)
         with lock:
             if job.get('generation') == generation:
                 job.update(state='error', message=detail)
@@ -193,7 +222,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized():
             return
-        global job_dir
+        global job_dir, job_cancel
+        if self.path == '/cancel':
+            with lock:
+                if job_cancel: job_cancel.set()
+                old = job_dir if job['state'] == 'ready' else None
+                job['generation'] = job.get('generation', 0) + 1
+                job['state'] = 'idle'
+                job_dir = None
+            if old: shutil.rmtree(old, ignore_errors=True)
+            return self.send(200, {'state': 'idle'})
         if self.path != '/start':
             return self.send(404, {'error': 'Rota inexistente'})
         try:
@@ -201,7 +239,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= 2048:
                 raise ValueError('Pedido muito grande ou vazio.')
             req = json.loads(self.rfile.read(size))
-            vid = video_id(req['url'])
+            video_url = validated_url(req['url'])
             width, height = int(req['width']), int(req['height'])
             fps = int(req.get('fps', FPS))
             if not (4 <= width <= 320 and 4 <= height <= 160 and width * height <= MAX_PIXELS):
@@ -211,18 +249,17 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as ex:
             return self.send(400, {'error': str(ex)})
         with lock:
-            if job['state'] == 'loading':
-                return self.send(409, {'error': 'Ja existe uma conversao em andamento.'})
-            old = job_dir
+            if job_cancel: job_cancel.set()
+            old = job_dir if job['state'] != 'loading' else None
             folder = Path(tempfile.mkdtemp(prefix='cc_tv_'))
             job_dir = folder
+            job_cancel = threading.Event()
             generation = job.get('generation', 0) + 1
             job.clear()
             job.update(state='loading', generation=generation, width=width, height=height, fps=fps)
         if old:
             shutil.rmtree(old, ignore_errors=True)
-        url = 'https://www.youtube.com/watch?v=' + vid
-        threading.Thread(target=worker, args=(generation, url, width, height, fps, folder), daemon=True).start()
+        threading.Thread(target=worker, args=(generation, video_url, width, height, fps, folder, job_cancel), daemon=True).start()
         self.send(202, {'state': 'loading'})
 
     def do_GET(self):
