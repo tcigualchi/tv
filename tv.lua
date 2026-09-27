@@ -70,20 +70,25 @@ local speakers = {peripheral.find('speaker')}
 local function audioThread()
   if not status.audio or #speakers == 0 then return end
   local decoder = require('cc.audio.dfpwm').make_decoder()
-  for n = 0, math.ceil(status.frames / status.fps * 48000 / 8 / 6144) do
-    local h = request('/audio?n=' .. n, nil, true)
-    local chunk = h.readAll()
+  local n = 0
+  while true do
+    local h = request('/audio?n=' .. n .. '&count=8', nil, true)
+    local batch = h.readAll()
     h.close()
-    if #chunk == 0 then return end
-    local samples = decoder(chunk)
-    local tasks = {}
-    for _, speaker in ipairs(speakers) do
-      local sp = speaker
-      tasks[#tasks+1] = function()
-        while not sp.playAudio(samples) do os.pullEvent('speaker_audio_empty') end
+    if #batch == 0 then return end
+    for offset = 1, #batch, 6144 do
+      local chunk = batch:sub(offset, offset + 6143)
+      local samples = decoder(chunk)
+      local tasks = {}
+      for _, speaker in ipairs(speakers) do
+        local sp = speaker
+        tasks[#tasks+1] = function()
+          while not sp.playAudio(samples) do os.pullEvent('speaker_audio_empty') end
+        end
       end
+      parallel.waitForAll(table.unpack(tasks))
     end
-    parallel.waitForAll(table.unpack(tasks))
+    n = n + 8
   end
 end
 local function videoThread()
@@ -92,17 +97,24 @@ local function videoThread()
   local start = os.epoch('utc')
   monitor.setBackgroundColor(colors.black)
   monitor.clear()
-  for n = 0, status.frames - 1 do
-    local h = request('/frame?n=' .. n, nil, true)
-    local frame = h.readAll()
+  local frameSize = width * height
+  for first = 0, status.frames - 1, 8 do
+    local h = request('/frame?n=' .. first .. '&count=8', nil, true)
+    local batch = h.readAll()
     h.close()
-    if #frame ~= width * height then error('Quadro incompleto ' .. n, 0) end
-    for y = 1, height do
-      monitor.setCursorPos(1, y)
-      monitor.blit(blank, fg, frame:sub((y-1)*width+1, y*width))
+    local count = math.min(8, status.frames - first)
+    if #batch ~= count * frameSize then error('Lote de quadros incompleto: ' .. first, 0) end
+    for i = 0, count - 1 do
+      local n = first + i
+      local offset = i * frameSize
+      for y = 1, height do
+        monitor.setCursorPos(1, y)
+        local left = offset + (y-1)*width+1
+        monitor.blit(blank, fg, batch:sub(left, left+width-1))
+      end
+      local delay = (start + (n+1)*1000/status.fps - os.epoch('utc')) / 1000
+      if delay > 0 then sleep(delay) else sleep(0) end
     end
-    local delay = (start + (n+1)*1000/status.fps - os.epoch('utc')) / 1000
-    if delay > 0 then sleep(delay) else sleep(0) end
   end
 end
 local previousPalette = {}

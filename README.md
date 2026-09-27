@@ -1,6 +1,6 @@
 # YouTube na TV do CC:Tweaked
 
-Cole um link no programa Lua `tv.lua`. O servidor Python no seu PC baixa o video, escolhe 16 cores para cada video e converte os quadros com dithering e converte o audio para DFPWM. O computador do Minecraft solicita cada quadro e pequenos trechos de audio por HTTP; o video **nao ocupa o disco do computador do jogo**.
+Cole um link no programa Lua `tv.lua`. O servidor Python no seu PC baixa o video, escolhe 16 cores para cada video e converte os quadros com dithering e converte o audio para DFPWM. O computador do Minecraft solicita lotes de ate 8 quadros e trechos de audio por HTTP; o video **nao ocupa o disco do computador do jogo**.
 
 ## Instalar no Windows
 
@@ -51,7 +51,7 @@ Se o Minecraft estiver no mesmo PC, pode usar apenas `tv` e manter o endereco lo
 ## Limites e problemas comuns
 
 - A URL do ngrok e publica: mantenha a chave privada. Ela muda sempre que o servidor Python reinicia, a menos que voce defina `CC_TV_TOKEN` no ambiente.
-- O prototipo aceita videos de ate 2 minutos e roda a 8 FPS por padrao; nao suporta lives em andamento. O servidor faz a conversao inteira antes de tocar. Conforme monitor e computador, os quadros podem atrasar e o som perder sincronia.
+- O prototipo aceita videos de ate 2 minutos e roda a 8 FPS por padrao. Em 2 minutos isso gera cerca de 120 pedidos de quadros, em vez de 960; nao suporta lives em andamento. O servidor faz a conversao inteira antes de tocar. Conforme monitor e computador, os quadros podem atrasar e o som perder sincronia.
 - O programa ajusta automaticamente a resolucao ao tamanho real do monitor em escala de texto 0.5 e preserva a proporcao do video (com faixas pretas quando preciso). Se o monitor for muito grande (mais de 12.000 caracteres), o servidor recusa para evitar sobrecarga; diminua o monitor ou aumente o limite no codigo.
 - Se aparecer `Domain not permitted`, verifique se HTTP esta ativo e se o host ngrok e permitido. Se aparecer `Servidor inacessivel`, confirme se ngrok e Python continuam ligados e se a URL HTTPS esta correta. Se aparecer `Chave de acesso incorreta`, copie a chave mostrada pelo Python, nao o authtoken do ngrok.
 - Alguns videos nao podem ser baixados (restricao regional, login, DRM, mudancas no YouTube). Tente um video publico curto e atualize `yt-dlp`.

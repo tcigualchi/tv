@@ -232,19 +232,23 @@ class Handler(BaseHTTPRequestHandler):
         if status['state'] != 'ready' or not folder:
             return self.send(409, {'error': 'Video ainda nao esta pronto.'})
         try:
-            n = int(parse_qs(p.query).get('n', ['-1'])[0])
+            query = parse_qs(p.query)
+            n = int(query.get('n', ['-1'])[0])
+            count = int(query.get('count', ['1'])[0])
+            if not 1 <= count <= 8:
+                raise ValueError('Lote deve ter entre 1 e 8 partes.')
             if p.path == '/frame':
                 if not 0 <= n < status['frames']:
                     raise ValueError('Quadro fora do intervalo.')
                 with (folder / 'frames.bin').open('rb') as f:
                     f.seek(n * status['width'] * status['height'])
-                    data = f.read(status['width'] * status['height'])
+                    data = f.read(min(count, status['frames'] - n) * status['width'] * status['height'])
             else:
                 if not status['audio'] or not 0 <= n <= 120 * 48000 // 8 // 6144 + 1:
                     raise ValueError('Audio indisponivel ou indice invalido.')
                 with (folder / 'audio.dfpwm').open('rb') as f:
                     f.seek(n * 6144)
-                    data = f.read(6144)
+                    data = f.read(count * 6144)
             return self.send(200, data, 'application/octet-stream')
         except (ValueError, OSError) as ex:
             return self.send(400, {'error': str(ex)})
