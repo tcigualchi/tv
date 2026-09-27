@@ -109,11 +109,27 @@ def run(cmd, **kwargs):
 
 
 def convert(url, width, height, fps, folder, cancel):
+    # Optional browser session for YouTube's sign-in/bot challenge. Never send it to the web UI.
+    youtube_host = (urlparse(url).hostname or '').lower()
+    is_youtube = youtube_host in ('youtube.com', 'youtu.be', 'youtube-nocookie.com',
+                                   'music.youtube.com', 'www.youtube.com', 'm.youtube.com') or youtube_host.endswith('.youtube.com')
+    cookie_file = os.environ.get('CC_TV_COOKIES_FILE', '').strip()
+    cookie_browser = os.environ.get('CC_TV_COOKIES_BROWSER', '').strip().lower()
+    auth_options = []
+    if is_youtube and cookie_file:
+        if not Path(cookie_file).is_file():
+            raise RuntimeError('Arquivo de cookies nao encontrado: confira CC_TV_COOKIES_FILE.')
+        auth_options = ['--cookies', cookie_file]
+    elif is_youtube and cookie_browser:
+        if cookie_browser not in ('firefox', 'chrome', 'chromium', 'brave', 'edge', 'vivaldi', 'opera'):
+            raise RuntimeError('Navegador de cookies invalido em CC_TV_COOKIES_BROWSER.')
+        auth_options = ['--cookies-from-browser', cookie_browser]
     command = [sys.executable, '-m', 'yt_dlp', '--no-playlist',
          '--no-progress', '--no-warnings',
          '--match-filter', f'duration <=? {MAX_SECONDS} & !is_live',
          '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b/bv*+ba/b/bestaudio/best',
-         '--merge-output-format', 'mkv', '--print', 'before_dl:CC_TV_TITLE:%(title)s', '-o', str(folder / 'source.%(ext)s'), url]
+         '--merge-output-format', 'mkv', '--print', 'before_dl:CC_TV_TITLE:%(title)s', '-o', str(folder / 'source.%(ext)s'),
+         *auth_options, url]
     download = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors='replace')
     try:
