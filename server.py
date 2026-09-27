@@ -19,8 +19,8 @@ from PIL import Image
 
 PORT = 8765
 FPS = 8
-MAX_SECONDS = 120
-MAX_PIXELS = 12000
+MAX_SECONDS = 300
+MAX_PIXELS = 32000
 # The CC:Tweaked default palette, in blit order (0..f).
 PALETTE = [
     (240,240,240), (242,178,51), (229,127,216), (153,178,242),
@@ -101,13 +101,19 @@ def run(cmd, **kwargs):
 
 
 def convert(url, width, height, fps, folder):
-    source = folder / 'source.mp4'
-    run([sys.executable, '-m', 'yt_dlp', '--no-playlist', '--no-progress', '--no-warnings',
+    command = [sys.executable, '-m', 'yt_dlp', '--no-playlist',
+         '--no-progress', '--no-warnings',
          '--match-filter', f'duration <= {MAX_SECONDS} & !is_live',
-         '--max-filesize', '150M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b',
-         '--merge-output-format', 'mp4', '-o', str(source), url], timeout=300)
-    if not source.exists():
-        raise RuntimeError('Nao foi possivel baixar o video. Veja disponibilidade e yt-dlp.')
+         '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b',
+         '--merge-output-format', 'mkv', '-o', str(folder / 'source.%(ext)s'), url]
+    result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=600)
+    if result.returncode:
+        raise RuntimeError('yt-dlp: ' + (result.stderr or result.stdout)[-1200:])
+    candidates = [p for p in folder.glob('source.*') if p.suffix in ('.mkv', '.mp4', '.webm')]
+    if not candidates:
+        detail = (result.stdout + '\n' + result.stderr).strip()[-1200:]
+        raise RuntimeError('yt-dlp nao gerou video. ' + (detail or 'Verifique o link.'))
+    source = candidates[0]
     palette = sampled_palette(source, width, height)
     cc_palette = make_palette(palette)
     count = 0
@@ -135,7 +141,7 @@ def convert(url, width, height, fps, folder):
     audio = folder / 'audio.dfpwm'
     try:
         run(['ffmpeg', '-y', '-v', 'error', '-i', str(source), '-t', str(MAX_SECONDS),
-             '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'dfpwm', '-f', 'dfpwm', str(audio)], timeout=120)
+             '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'dfpwm', '-f', 'dfpwm', str(audio)], timeout=240)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         audio.unlink(missing_ok=True)
     source.unlink(missing_ok=True)
@@ -153,6 +159,7 @@ def worker(generation, url, width, height, fps, folder):
         detail = str(ex)
         if isinstance(ex, subprocess.CalledProcessError) and ex.stderr:
             detail = ex.stderr.decode('utf-8', errors='replace')[-700:]
+        print('Falha na conversao: ' + detail, flush=True)
         with lock:
             if job.get('generation') == generation:
                 job.update(state='error', message=detail)
@@ -197,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
             vid = video_id(req['url'])
             width, height = int(req['width']), int(req['height'])
             fps = int(req.get('fps', FPS))
-            if not (4 <= width <= 240 and 4 <= height <= 100 and width * height <= MAX_PIXELS):
+            if not (4 <= width <= 320 and 4 <= height <= 160 and width * height <= MAX_PIXELS):
                 raise ValueError('Resolucao invalida ou grande demais.')
             if not 1 <= fps <= 10:
                 raise ValueError('FPS deve ser entre 1 e 10.')
@@ -238,13 +245,15 @@ class Handler(BaseHTTPRequestHandler):
             if not 1 <= count <= 8:
                 raise ValueError('Lote deve ter entre 1 e 8 partes.')
             if p.path == '/frame':
+                if count * status['width'] * status['height'] > 96000:
+                    raise ValueError('Lote de quadros grande demais para esta resolucao.')
                 if not 0 <= n < status['frames']:
                     raise ValueError('Quadro fora do intervalo.')
                 with (folder / 'frames.bin').open('rb') as f:
                     f.seek(n * status['width'] * status['height'])
                     data = f.read(min(count, status['frames'] - n) * status['width'] * status['height'])
             else:
-                if not status['audio'] or not 0 <= n <= 120 * 48000 // 8 // 6144 + 1:
+                if not status['audio'] or not 0 <= n <= MAX_SECONDS * 48000 // 8 // 6144 + 1:
                     raise ValueError('Audio indisponivel ou indice invalido.')
                 with (folder / 'audio.dfpwm').open('rb') as f:
                     f.seek(n * 6144)

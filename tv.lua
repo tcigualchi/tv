@@ -98,11 +98,13 @@ local function videoThread()
   monitor.setBackgroundColor(colors.black)
   monitor.clear()
   local frameSize = width * height
-  for first = 0, status.frames - 1, 8 do
-    local h = request('/frame?n=' .. first .. '&count=8', nil, true)
+  local batchSize = math.max(1, math.min(8, math.floor(96000 / frameSize)))
+  print('Quadros por pedido: ' .. batchSize)
+  for first = 0, status.frames - 1, batchSize do
+    local h = request('/frame?n=' .. first .. '&count=' .. batchSize, nil, true)
     local batch = h.readAll()
     h.close()
-    local count = math.min(8, status.frames - first)
+    local count = math.min(batchSize, status.frames - first)
     if #batch ~= count * frameSize then error('Lote de quadros incompleto: ' .. first, 0) end
     for i = 0, count - 1 do
       local n = first + i

@@ -51,10 +51,10 @@ Se o Minecraft estiver no mesmo PC, pode usar apenas `tv` e manter o endereco lo
 ## Limites e problemas comuns
 
 - A URL do ngrok e publica: mantenha a chave privada. Ela muda sempre que o servidor Python reinicia, a menos que voce defina `CC_TV_TOKEN` no ambiente.
-- O prototipo aceita videos de ate 2 minutos e roda a 8 FPS por padrao. Em 2 minutos isso gera cerca de 120 pedidos de quadros, em vez de 960; nao suporta lives em andamento. O servidor faz a conversao inteira antes de tocar. Conforme monitor e computador, os quadros podem atrasar e o som perder sincronia.
-- O programa ajusta automaticamente a resolucao ao tamanho real do monitor em escala de texto 0.5 e preserva a proporcao do video (com faixas pretas quando preciso). Se o monitor for muito grande (mais de 12.000 caracteres), o servidor recusa para evitar sobrecarga; diminua o monitor ou aumente o limite no codigo.
+- O prototipo aceita videos de ate 5 minutos e roda a 8 FPS por padrao. Em 5 minutos isso gera cerca de 300 pedidos de quadros, em vez de 2400; nao suporta lives em andamento. O servidor faz a conversao inteira antes de tocar. Conforme monitor e computador, os quadros podem atrasar e o som perder sincronia.
+- O programa ajusta automaticamente a resolucao ao tamanho real do monitor em escala de texto 0.5 e preserva a proporcao do video (com faixas pretas quando preciso). O limite agora e de 32.000 caracteres por quadro, com largura ate 320 e altura ate 160. Monitores 8x6 cabem nesse limite; o Lua diminui automaticamente o numero de quadros por pedido para manter a transferencia abaixo de 96 KB. Em monitores grandes, a conversao demora mais; experimente 5 FPS se houver travamentos.
 - Se aparecer `Domain not permitted`, verifique se HTTP esta ativo e se o host ngrok e permitido. Se aparecer `Servidor inacessivel`, confirme se ngrok e Python continuam ligados e se a URL HTTPS esta correta. Se aparecer `Chave de acesso incorreta`, copie a chave mostrada pelo Python, nao o authtoken do ngrok.
-- Alguns videos nao podem ser baixados (restricao regional, login, DRM, mudancas no YouTube). Tente um video publico curto e atualize `yt-dlp`.
+- Apenas videos com duracao de ate 300 segundos sao aceitos. Se um download falhar, o Python mostra a causa enviada pelo `yt-dlp` (video acima do limite, bloqueio regional, login, DRM ou mudancas no YouTube). Tente um video publico curto e atualize `yt-dlp`.
 - O servidor e o conversor devem ser usados somente com conteudo para o qual voce tem permissao de acesso e uso.
 
 Codigo independente; nao usa os arquivos `.mcanim` nem as bibliotecas Lua do projeto NeuGoga.
