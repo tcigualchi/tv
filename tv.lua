@@ -16,9 +16,25 @@ if fps < 1 or fps > 10 then error('FPS deve ser entre 1 e 10.', 0) end
 monitor.setTextScale(0.5)
 local width, height = monitor.getSize()
 
-write('Chave exibida no PC: ')
-local token = read('*')
-if not token or token == '' then error('Chave vazia.', 0) end
+local configFile = 'tv_config.json'
+local token = nil
+if fs.exists(configFile) then
+  local f = fs.open(configFile, 'r')
+  if f then
+    local saved = textutils.unserializeJSON(f.readAll())
+    f.close()
+    if type(saved)=='table' and saved.server==server and type(saved.token)=='string' then
+      token = saved.token
+    end
+  end
+end
+local function askKey()
+  write('Chave do servidor (somente uma vez): ')
+  local value=read('*')
+  if not value or value=='' then error('Chave vazia.',0) end
+  return value
+end
+if not token then token=askKey() end
 local headers = {Authorization='Bearer ' .. token, ['ngrok-skip-browser-warning']='1'}
 local function jsonResponse(handle)
   local raw, code = handle.readAll(), handle.getResponseCode()
@@ -48,7 +64,17 @@ local function request(path, body, binary)
   end
   return h
 end
-jsonResponse(request('/status')) -- Check key/tunnel before showing the player.
+local ok, checkError=pcall(function() jsonResponse(request('/status')) end)
+if not ok and tostring(checkError):find('401',1,true) then
+  print('Chave antiga nao funciona. Digite a nova chave:')
+  token=askKey()
+  headers.Authorization='Bearer '..token
+  ok,checkError=pcall(function() jsonResponse(request('/status')) end)
+end
+if not ok then error(checkError,0) end
+local cfg=fs.open(configFile,'w')
+if cfg then cfg.write(textutils.serializeJSON({server=server,token=token}));cfg.close() end
+
 
 local playlistFile = 'tv_playlist.json'
 local playlist = {}
@@ -301,9 +327,8 @@ local function playbackLoop()
       if not ok and state.abort then status('Parado')
       elseif not ok then status('Erro: '..tostring(finished))
       elseif not state.abort and finished and not state.intent then
-        local next=nextIndex(index)
-        if next and next~=index then state.intent=next;selected=next
-        else status('Video concluido') end
+        if index < #playlist then state.intent=index+1;selected=index+1
+        else status('Lista concluida') end
       elseif not state.intent and state.abort then
         monitor.setBackgroundColor(colors.black)
         monitor.clear()

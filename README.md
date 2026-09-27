@@ -42,7 +42,7 @@ Cole o link publico de um video no programa Lua `tv.lua`. O servidor Python no s
    tv https://exemplo.ngrok-free.app
    ```
 
-4. Digite a **CHAVE DE ACESSO** mostrada no servidor Python e cole o link do video quando solicitado. A chave e pedida a cada execucao e nao fica salva no jogo.
+4. Digite a **CHAVE DE ACESSO** mostrada no servidor Python e cole o link do video quando solicitado. A chave e pedida apenas na primeira execucao e fica salva em `tv_config.json` no computador do Minecraft. Se ela mudar, o Lua pede a nova.
 
 Tambem pode fornecer o link diretamente: `tv https://exemplo.com/video https://exemplo.ngrok-free.app`. Para escolher FPS, passe um terceiro argumento de 1 a 10: `tv https://exemplo.com/video https://exemplo.ngrok-free.app 10`. FPS maior gera mais trafego e pode engasgar em monitores grandes.
 
@@ -65,11 +65,45 @@ Aceita links publicos HTTP/HTTPS de sites compativeis com `yt-dlp`, incluindo li
 
 ## Interface do computador
 
-O arquivo `tv.lua` agora abre um player no terminal do computador; o monitor mostra somente o video. Digite a chave uma vez ao iniciar. A lista fica salva em `tv_playlist.json` dentro do computador. E necessario um **computador avancado** para clicar com o mouse; as teclas funcionam sem mouse.
+O arquivo `tv.lua` agora abre um player no terminal do computador; o monitor mostra somente o video. Digite a chave uma vez na primeira execucao. A lista fica salva em `tv_playlist.json` dentro do computador. E necessario um **computador avancado** para clicar com o mouse; as teclas funcionam sem mouse.
 
 - **A / Adicionar:** cole um link de video na lista. **Setas e Enter / Tocar:** selecione e reproduza. Um link fornecido como argumento e incluido na lista.
 - **+ e - / Vol:** altere o volume do speaker em passos de 25%, de 0% a 300%. O novo volume vale para os proximos blocos de audio.
 - **S / Stop:** interrompe video, audio e conversao no PC. **N / Next:** passa para o proximo item da lista. **D / Apagar:** remove o item selecionado. **Q:** fecha o player.
-- Ao terminar um video, o proximo item da lista comeca automaticamente. Se a lista tiver apenas um item, ele termina.
+- Ao terminar um video, o proximo item da lista comeca automaticamente. No fim da lista o player para para evitar gasto continuo de banda. O botao Next pode voltar ao inicio manualmente.
 
 Para abrir sem video predefinido: `tv https://SUA_URL.ngrok-free.dev`.
+
+## Servidor Kali Linux 24 horas
+
+Coloque a pasta extraida em um local permanente do notebook (por exemplo `~/cc-tv-youtube`). Instale Python, ambiente virtual e FFmpeg:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-venv python3-pip ffmpeg
+```
+
+Instale o [ngrok para Linux](https://ngrok.com/download/linux) e associe **sua conta** no Kali (o authtoken nao deve ser enviado a amigos):
+
+```bash
+ngrok config add-authtoken SEU_AUTHTOKEN
+```
+
+Confira no painel ngrok se `strength-ranging-buddhist.ngrok-free.dev` pertence a sua conta; use a URL HTTPS reservada da sua conta se for diferente. Na pasta deste projeto, execute:
+
+```bash
+bash install_kali.sh https://strength-ranging-buddhist.ngrok-free.dev
+sudo loginctl enable-linger "$USER"
+```
+
+O instalador cria um ambiente virtual, instala os requisitos Python e configura os servicos de usuario `cc-tv.service` e `cc-tv-ngrok.service` para reiniciarem apos falhas. Ele gera uma chave permanente em `~/.config/cc-tv/server.env`; nao envie esse arquivo a ninguem. Copie **apenas a chave exibida ao final** e a URL HTTPS para os amigos. Eles usam `tv.lua` no computador do Minecraft deles e inserem a chave na primeira execucao. O Lua guarda a chave naquele computador em `tv_config.json`. Para ver a chave depois, use `sed -n 's/^CC_TV_TOKEN=//p' ~/.config/cc-tv/server.env` no Kali.
+
+Verifique os servicos e acompanhe erros:
+
+```bash
+systemctl --user status cc-tv.service cc-tv-ngrok.service
+journalctl --user -u cc-tv.service -f
+journalctl --user -u cc-tv-ngrok.service -f
+```
+
+O notebook precisa ficar ligado, na tomada e sem suspender quando a tampa for fechada. Configure isso nas opcoes de energia do Kali. Se mover a pasta depois da instalacao, rode o instalador outra vez a partir do novo local. O servidor atual tem **uma reproducao/conversao ativa por vez**; se dois computadores enviarem videos diferentes, o segundo troca a reproducao do primeiro. O ngrok pode ter limites de requisicoes e transferencia de acordo com o plano da conta.

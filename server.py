@@ -309,9 +309,16 @@ def main():
         parser.error('Instale as dependencias: py -m pip install -r requirements.txt')
     if not shutil.which('ffmpeg'):
         parser.error('ffmpeg nao encontrado no PATH')
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as ex:
+        if ex.errno == 98 or ex.errno == 10048:
+            parser.error(f'Porta {args.port} ja em uso. Verifique: systemctl --user status cc-tv.service; ss -ltnp sport = :{args.port}')
+        raise
     print(f'Servidor iniciado em http://{args.host}:{args.port} (Ctrl+C para parar)', flush=True)
     print(f'CHAVE DE ACESSO: {ACCESS_TOKEN}', flush=True)
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    with server:
+        server.serve_forever()
 
 if __name__ == '__main__':
     main()
