@@ -74,6 +74,23 @@ O arquivo `tv.lua` agora abre um player no terminal do computador; o monitor mos
 
 Para abrir sem video predefinido: `tv https://SUA_URL.ngrok-free.dev`.
 
+## Controle web no celular ou PC
+
+Abra no navegador a mesma URL HTTPS do ngrok usada pelo `tv.lua`. A pagina `dashboard.html` mostra o video atual, o tempo de reproducao e o estado da TV. Digite a chave de acesso do servidor para entrar; a pagina oferece Play/Pause, Stop, Next e volume de 0% a 300%. A interface se ajusta a telas pequenas. Os videos aparecem apenas no monitor do Minecraft, e os links da lista continuam sendo adicionados pelo computador do jogo.
+
+O `tv.lua` precisa permanecer aberto no computador do Minecraft. Atualize **juntos** `server.py`, `requirements.txt`, `dashboard.html` no Kali e `tv.lua` no computador do jogo: a interface usa WebSocket para receber o estado e enviar comandos. A sessao do navegador usa cookie seguro com duracao de 24 horas; a chave nao fica salva no JavaScript nem na URL.
+
+Se voce ja instalou o servico em `~/Downloads/cc-tv-youtube`, copie os tres arquivos novos do servidor da pasta extraida para **essa pasta ativa** e execute:
+
+```bash
+cd ~/Downloads/cc-tv-youtube
+.venv/bin/python -m pip install -r requirements.txt
+systemctl --user restart cc-tv.service
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8765/
+```
+
+O ultimo comando deve mostrar `200`. Atualize `tv.lua` no computador do Minecraft, reinicie o programa `tv` e acesse o endereco HTTPS do ngrok no navegador. A chave que voce ja configurou no servico continua valida. Se o servico mostrar erro, consulte `journalctl --user -u cc-tv.service -n 40 --no-pager`.
+
 ## Servidor Kali Linux 24 horas
 
 Coloque a pasta extraida em um local permanente do notebook (por exemplo `~/cc-tv-youtube`). Instale Python, ambiente virtual e FFmpeg:

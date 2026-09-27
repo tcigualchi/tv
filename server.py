@@ -14,7 +14,11 @@ import subprocess
 import sys
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response
+import asyncio
+import time
+import uvicorn
 from urllib.parse import parse_qs, urlparse
 
 from PIL import Image
@@ -109,7 +113,7 @@ def convert(url, width, height, fps, folder, cancel):
          '--no-progress', '--no-warnings',
          '--match-filter', f'duration <=? {MAX_SECONDS} & !is_live',
          '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b/bv*+ba/b',
-         '--merge-output-format', 'mkv', '-o', str(folder / 'source.%(ext)s'), url]
+         '--merge-output-format', 'mkv', '--print', 'before_dl:CC_TV_TITLE:%(title)s', '-o', str(folder / 'source.%(ext)s'), url]
     download = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors='replace')
     try:
@@ -133,6 +137,8 @@ def convert(url, width, height, fps, folder, cancel):
         detail = (output + '\n' + errors).strip()[-1200:]
         raise RuntimeError('yt-dlp nao gerou video. ' + (detail or 'Verifique o link.'))
     source = candidates[0]
+    title = next((line.split('CC_TV_TITLE:', 1)[1].strip() for line in output.splitlines()
+                  if line.startswith('CC_TV_TITLE:')), source.stem)[:120]
     if cancel.is_set():
         raise RuntimeError('Conversao cancelada.')
     palette = sampled_palette(source, width, height)
@@ -173,16 +179,16 @@ def convert(url, width, height, fps, folder, cancel):
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         audio.unlink(missing_ok=True)
     source.unlink(missing_ok=True)
-    return count, audio.exists(), ['#%02x%02x%02x' % rgb for rgb in palette]
+    return count, audio.exists(), ['#%02x%02x%02x' % rgb for rgb in palette], title
 
 
 def worker(generation, url, width, height, fps, folder, cancel):
     global job_dir
     try:
-        count, has_audio, palette = convert(url, width, height, fps, folder, cancel)
+        count, has_audio, palette, title = convert(url, width, height, fps, folder, cancel)
         with lock:
             if job.get('generation') == generation:
-                job.update(state='ready', frames=count, audio=has_audio, palette=palette)
+                job.update(state='ready', frames=count, audio=has_audio, palette=palette, title=title)
     except Exception as ex:
         detail = str(ex)
         if isinstance(ex, subprocess.CalledProcessError) and ex.stderr:
@@ -199,126 +205,253 @@ def worker(generation, url, width, height, fps, folder, cancel):
             shutil.rmtree(folder, ignore_errors=True)
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        print('%s %s' % (self.address_string(), fmt % args))
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+DASHBOARD = Path(__file__).with_name('dashboard.html')
+SESSIONS = {}
+SESSION_TTL = 24 * 3600
+web_clients = set()
+tv_socket = None
+last_tv_state = {'type': 'state', 'online': False, 'playing': False}
 
-    def send(self, code, data, content_type='application/json'):
-        if isinstance(data, dict):
-            data = json.dumps(data).encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', content_type)
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
-    def authorized(self):
-        provided = self.headers.get('Authorization', '')
-        if not hmac.compare_digest(provided, 'Bearer ' + ACCESS_TOKEN):
-            self.send(401, {'error': 'Chave de acesso incorreta.'})
-            return False
+def authenticated(request):
+    bearer = request.headers.get('authorization', '')
+    if hmac.compare_digest(bearer, 'Bearer ' + ACCESS_TOKEN):
         return True
+    session = request.cookies.get('cc_tv_session', '')
+    issued = SESSIONS.get(session, 0)
+    return bool(session and issued and time.time() - issued < SESSION_TTL)
 
-    def do_POST(self):
-        if not self.authorized():
-            return
-        global job_dir, job_cancel
-        if self.path == '/cancel':
-            with lock:
-                if job_cancel: job_cancel.set()
-                old = job_dir if job['state'] == 'ready' else None
-                job['generation'] = job.get('generation', 0) + 1
-                job['state'] = 'idle'
-                job_dir = None
-            if old: shutil.rmtree(old, ignore_errors=True)
-            return self.send(200, {'state': 'idle'})
-        if self.path != '/start':
-            return self.send(404, {'error': 'Rota inexistente'})
-        try:
-            size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 2048:
-                raise ValueError('Pedido muito grande ou vazio.')
-            req = json.loads(self.rfile.read(size))
-            video_url = validated_url(req['url'])
-            width, height = int(req['width']), int(req['height'])
-            fps = int(req.get('fps', FPS))
-            if not (4 <= width <= 320 and 4 <= height <= 160 and width * height <= MAX_PIXELS):
-                raise ValueError('Resolucao invalida ou grande demais.')
-            if not 1 <= fps <= 10:
-                raise ValueError('FPS deve ser entre 1 e 10.')
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as ex:
-            return self.send(400, {'error': str(ex)})
-        with lock:
-            if job_cancel: job_cancel.set()
-            old = job_dir if job['state'] != 'loading' else None
-            folder = Path(tempfile.mkdtemp(prefix='cc_tv_'))
-            job_dir = folder
-            job_cancel = threading.Event()
-            generation = job.get('generation', 0) + 1
-            job.clear()
-            job.update(state='loading', generation=generation, width=width, height=height, fps=fps)
-        if old:
-            shutil.rmtree(old, ignore_errors=True)
-        threading.Thread(target=worker, args=(generation, video_url, width, height, fps, folder, job_cancel), daemon=True).start()
-        self.send(202, {'state': 'loading'})
 
-    def do_GET(self):
-        if not self.authorized():
-            return
-        p = urlparse(self.path)
-        if p.path not in ('/status', '/frame', '/audio'):
-            return self.send(404, {'error': 'Rota inexistente'})
-        with lock:
-            status = {k:v for k,v in job.items() if k != 'generation'}
-            folder = job_dir
-        if p.path == '/status':
-            return self.send(200, status)
-        if status['state'] != 'ready' or not folder:
-            return self.send(409, {'error': 'Video ainda nao esta pronto.'})
+def require_auth(request):
+    if not authenticated(request):
+        raise HTTPException(401, detail='Chave de acesso incorreta.')
+
+
+def browser_session(request):
+    session = request.cookies.get('cc_tv_session', '')
+    issued = SESSIONS.get(session, 0)
+    return bool(session and issued and time.time() - issued < SESSION_TTL)
+
+
+@app.get('/')
+def home():
+    return FileResponse(DASHBOARD, media_type='text/html', headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/login')
+async def login(request: Request):
+    data = await request.json()
+    key = data.get('key', '') if isinstance(data, dict) else ''
+    if not isinstance(key, str) or not hmac.compare_digest(key, ACCESS_TOKEN):
+        raise HTTPException(401, detail='Chave incorreta.')
+    session = secrets.token_urlsafe(32)
+    SESSIONS[session] = time.time()
+    response = Response(content='{"ok":true}', media_type='application/json')
+    response.set_cookie('cc_tv_session', session, max_age=SESSION_TTL,
+                        httponly=True, secure=True, samesite='strict')
+    return response
+
+
+@app.get('/api/session')
+def session_status(request: Request):
+    if not browser_session(request):
+        raise HTTPException(401, detail='Sessao expirada.')
+    return {'ok': True}
+
+
+@app.get('/status')
+def get_status(request: Request):
+    require_auth(request)
+    with lock:
+        return {k: v for k, v in job.items() if k != 'generation'}
+
+
+@app.post('/start')
+async def start_video(request: Request):
+    global job_dir, job_cancel
+    require_auth(request)
+    try:
+        data = await request.json()
+        video_url = validated_url(data['url'])
+        width, height = int(data['width']), int(data['height'])
+        fps = int(data.get('fps', FPS))
+        if not (4 <= width <= 320 and 4 <= height <= 160 and width * height <= MAX_PIXELS):
+            raise ValueError('Resolucao invalida ou grande demais.')
+        if not 1 <= fps <= 10:
+            raise ValueError('FPS deve ser entre 1 e 10.')
+    except (ValueError, KeyError, TypeError) as ex:
+        raise HTTPException(400, detail=str(ex)) from ex
+    with lock:
+        if job_cancel:
+            job_cancel.set()
+        old = job_dir if job['state'] != 'loading' else None
+        folder = Path(tempfile.mkdtemp(prefix='cc_tv_'))
+        job_dir = folder
+        job_cancel = threading.Event()
+        generation = job.get('generation', 0) + 1
+        job.clear()
+        job.update(state='loading', generation=generation, width=width, height=height, fps=fps)
+        cancel = job_cancel
+    if old:
+        shutil.rmtree(old, ignore_errors=True)
+    threading.Thread(target=worker,
+                     args=(generation, video_url, width, height, fps, folder, cancel),
+                     daemon=True).start()
+    return Response(content='{"state":"loading"}', status_code=202, media_type='application/json')
+
+
+@app.post('/cancel')
+def cancel_video(request: Request):
+    global job_dir
+    require_auth(request)
+    with lock:
+        if job_cancel:
+            job_cancel.set()
+        old = job_dir if job['state'] == 'ready' else None
+        job['generation'] = job.get('generation', 0) + 1
+        job['state'] = 'idle'
+        job_dir = None
+    if old:
+        shutil.rmtree(old, ignore_errors=True)
+    return {'state': 'idle'}
+
+
+@app.get('/frame')
+def get_frame(request: Request, n: int, count: int = 1):
+    require_auth(request)
+    with lock:
+        data, folder = job.copy(), job_dir
+    if data['state'] != 'ready' or not folder:
+        raise HTTPException(409, detail='Video ainda nao esta pronto.')
+    if not 1 <= count <= 8 or count * data['width'] * data['height'] > 96000:
+        raise HTTPException(400, detail='Lote de quadros grande demais.')
+    if not 0 <= n < data['frames']:
+        raise HTTPException(400, detail='Quadro fora do intervalo.')
+    try:
+        with (folder / 'frames.bin').open('rb') as f:
+            f.seek(n * data['width'] * data['height'])
+            payload = f.read(min(count, data['frames'] - n) * data['width'] * data['height'])
+    except OSError as ex:
+        raise HTTPException(409, detail='Video foi trocado.') from ex
+    return Response(content=payload, media_type='application/octet-stream')
+
+
+@app.get('/audio')
+def get_audio(request: Request, n: int, count: int = 1):
+    require_auth(request)
+    with lock:
+        data, folder = job.copy(), job_dir
+    if data['state'] != 'ready' or not folder:
+        raise HTTPException(409, detail='Audio ainda nao esta pronto.')
+    if not data.get('audio') or not 1 <= count <= 8 or not 0 <= n <= MAX_SECONDS * 48000 // 8 // 6144 + 1:
+        raise HTTPException(400, detail='Audio indisponivel ou indice invalido.')
+    try:
+        with (folder / 'audio.dfpwm').open('rb') as f:
+            f.seek(n * 6144)
+            payload = f.read(count * 6144)
+    except OSError as ex:
+        raise HTTPException(409, detail='Audio foi trocado.') from ex
+    return Response(content=payload, media_type='application/octet-stream')
+
+
+async def broadcast_state():
+    for client in list(web_clients):
         try:
-            query = parse_qs(p.query)
-            n = int(query.get('n', ['-1'])[0])
-            count = int(query.get('count', ['1'])[0])
-            if not 1 <= count <= 8:
-                raise ValueError('Lote deve ter entre 1 e 8 partes.')
-            if p.path == '/frame':
-                if count * status['width'] * status['height'] > 96000:
-                    raise ValueError('Lote de quadros grande demais para esta resolucao.')
-                if not 0 <= n < status['frames']:
-                    raise ValueError('Quadro fora do intervalo.')
-                with (folder / 'frames.bin').open('rb') as f:
-                    f.seek(n * status['width'] * status['height'])
-                    data = f.read(min(count, status['frames'] - n) * status['width'] * status['height'])
-            else:
-                if not status['audio'] or not 0 <= n <= MAX_SECONDS * 48000 // 8 // 6144 + 1:
-                    raise ValueError('Audio indisponivel ou indice invalido.')
-                with (folder / 'audio.dfpwm').open('rb') as f:
-                    f.seek(n * 6144)
-                    data = f.read(count * 6144)
-            return self.send(200, data, 'application/octet-stream')
-        except (ValueError, OSError) as ex:
-            return self.send(400, {'error': str(ex)})
+            await client.send_json(last_tv_state)
+        except Exception:
+            web_clients.discard(client)
+
+
+@app.websocket('/ws')
+async def websocket_endpoint(websocket: WebSocket):
+    global tv_socket, last_tv_state
+    origin = websocket.headers.get('origin')
+    origin_host = urlparse(origin).hostname if origin else None
+    request_host = (websocket.headers.get('x-forwarded-host') or websocket.headers.get('host') or '').split(':')[0]
+    if origin and origin_host != request_host:
+        await websocket.close(code=1008)
+        return
+    is_tv = hmac.compare_digest(websocket.headers.get('authorization', ''), 'Bearer ' + ACCESS_TOKEN)
+    session = websocket.cookies.get('cc_tv_session', '')
+    is_browser = bool(session and SESSIONS.get(session, 0) and time.time() - SESSIONS[session] < SESSION_TTL)
+    if not (is_tv or is_browser):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    if is_tv:
+        if tv_socket:
+            try:
+                await tv_socket.close(code=1000)
+            except Exception:
+                pass
+        tv_socket = websocket
+    else:
+        web_clients.add(websocket)
+        await websocket.send_json(last_tv_state)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if not isinstance(data, dict):
+                continue
+            if is_tv and data.get('type') == 'state':
+                last_tv_state = {
+                    'type': 'state', 'online': True,
+                    'playing': bool(data.get('playing')),
+                    'paused': bool(data.get('paused')),
+                    'status': str(data.get('status', ''))[:100],
+                    'title': str(data.get('title', ''))[:120],
+                    'url': str(data.get('url', ''))[:1900],
+                    'progress': max(0, min(300, float(data.get('progress') or 0))),
+                    'duration': max(0, min(300, float(data.get('duration') or 0))),
+                    'volume': max(0, min(3, float(data.get('volume') or 0))),
+                }
+                await broadcast_state()
+            elif is_browser and data.get('type') == 'control':
+                action = data.get('action')
+                if action not in ('play', 'pause', 'resume', 'stop', 'next', 'volume'):
+                    continue
+                try:
+                    value = max(0, min(3, float(data.get('value', 0)))) if action == 'volume' else None
+                except (ValueError, TypeError):
+                    continue
+                if tv_socket:
+                    try:
+                        await tv_socket.send_json({'type': 'control', 'action': action, 'value': value})
+                    except Exception:
+                        pass
+    except (WebSocketDisconnect, RuntimeError, ValueError, TypeError):
+        pass
+    finally:
+        if is_tv and tv_socket is websocket:
+            tv_socket = None
+            last_tv_state = {'type': 'state', 'online': False, 'playing': False}
+            await broadcast_state()
+        else:
+            web_clients.discard(websocket)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--host', default='127.0.0.1', help='IP local; use 0.0.0.0 so em rede privada confiavel')
+    parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=PORT)
     args = parser.parse_args()
     if importlib.util.find_spec('yt_dlp') is None:
-        parser.error('Instale as dependencias: py -m pip install -r requirements.txt')
+        parser.error('Instale as dependencias com pip install -r requirements.txt')
     if not shutil.which('ffmpeg'):
         parser.error('ffmpeg nao encontrado no PATH')
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        listener.bind((args.host, args.port))
+        listener.listen(128)
     except OSError as ex:
-        if ex.errno == 98 or ex.errno == 10048:
-            parser.error(f'Porta {args.port} ja em uso. Verifique: systemctl --user status cc-tv.service; ss -ltnp sport = :{args.port}')
-        raise
-    print(f'Servidor iniciado em http://{args.host}:{args.port} (Ctrl+C para parar)', flush=True)
+        listener.close()
+        parser.error(f'Nao foi possivel abrir a porta {args.port}: {ex}')
+    print(f'Servidor iniciado em http://{args.host}:{args.port}', flush=True)
     print(f'CHAVE DE ACESSO: {ACCESS_TOKEN}', flush=True)
-    with server:
-        server.serve_forever()
+    config = uvicorn.Config(app, host=args.host, port=args.port, log_level='warning', ws='websockets')
+    uvicorn.Server(config).run(sockets=[listener])
 
 if __name__ == '__main__':
     main()
