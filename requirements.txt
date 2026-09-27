@@ -1,4 +1,4 @@
 Pillow>=10,<13
-yt-dlp
+yt-dlp[default]
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1

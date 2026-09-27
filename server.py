@@ -108,28 +108,63 @@ def run(cmd, **kwargs):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
 
 
-def convert(url, width, height, fps, folder, cancel):
+def yt_auth_options(url):
     # Optional browser session for YouTube's sign-in/bot challenge. Never send it to the web UI.
     youtube_host = (urlparse(url).hostname or '').lower()
     is_youtube = youtube_host in ('youtube.com', 'youtu.be', 'youtube-nocookie.com',
                                    'music.youtube.com', 'www.youtube.com', 'm.youtube.com') or youtube_host.endswith('.youtube.com')
     cookie_file = os.environ.get('CC_TV_COOKIES_FILE', '').strip()
     cookie_browser = os.environ.get('CC_TV_COOKIES_BROWSER', '').strip().lower()
-    auth_options = []
     if is_youtube and cookie_file:
         if not Path(cookie_file).is_file():
             raise RuntimeError('Arquivo de cookies nao encontrado: confira CC_TV_COOKIES_FILE.')
-        auth_options = ['--cookies', cookie_file]
-    elif is_youtube and cookie_browser:
+        return ['--cookies', cookie_file]
+    if is_youtube and cookie_browser:
         if cookie_browser not in ('firefox', 'chrome', 'chromium', 'brave', 'edge', 'vivaldi', 'opera'):
             raise RuntimeError('Navegador de cookies invalido em CC_TV_COOKIES_BROWSER.')
-        auth_options = ['--cookies-from-browser', cookie_browser]
+        return ['--cookies-from-browser', cookie_browser]
+    return []
+
+
+def lookup_title(url):
+    command = [sys.executable, '-m', 'yt_dlp', '--no-playlist', '--skip-download',
+               '--no-progress', '--no-warnings', '--print', '%(title)s',
+               *yt_auth_options(url), url]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=18)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode:
+        return None
+    title = next((line.strip() for line in result.stdout.splitlines() if line.strip()), '')
+    return title[:120] or None
+
+
+def render_audio_frames(source, width, height, fps, folder, cancel, seconds):
+    palette = PALETTE
+    count = min(fps * MAX_SECONDS, max(1, int(seconds * fps)))
+    bg = b'f' * (width * height)
+    with (folder / 'frames.bin').open('wb') as dst:
+        for i in range(count):
+            if cancel.is_set():
+                raise RuntimeError('Conversao cancelada.')
+            frame = bytearray(bg)
+            for bar in range(4, width - 4, max(2, width // 36)):
+                phase = (bar * 13 + i * 7) % 29
+                magnitude = max(2, (height // 2) * (8 + abs(phase - 14)) // 22)
+                for y in range(max(2, height // 2 - magnitude), min(height - 2, height // 2 + magnitude)):
+                    frame[y * width + bar] = ord('b' if y < height // 2 else '9')
+            dst.write(frame)
+    return count, palette
+
+
+def convert(url, width, height, fps, folder, cancel):
     command = [sys.executable, '-m', 'yt_dlp', '--no-playlist',
          '--no-progress', '--no-warnings',
          '--match-filter', f'duration <=? {MAX_SECONDS} & !is_live',
          '--max-filesize', '300M', '-f', 'bv*[height<=480]+ba/b[height<=480]/b/bv*+ba/b/bestaudio/best',
          '--merge-output-format', 'mkv', '--print', 'before_dl:CC_TV_TITLE:%(title)s', '-o', str(folder / 'source.%(ext)s'),
-         *auth_options, url]
+         *yt_auth_options(url), url]
     download = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors='replace')
     try:
@@ -162,58 +197,54 @@ def convert(url, width, height, fps, folder, cancel):
                            capture_output=True, text=True, check=True)
     media = json.loads(probe.stdout)
     audio_only = not any(s.get('codec_type') == 'video' for s in media.get('streams', []))
+    fallback_visual = audio_only
+    has_audio = any(s.get('codec_type') == 'audio' for s in media.get('streams', []))
+    if not has_audio and audio_only:
+        raise RuntimeError('Arquivo sem video ou audio reproduzivel.')
+    try:
+        seconds = min(MAX_SECONDS, float(media['format']['duration']))
+    except (KeyError, ValueError, TypeError):
+        seconds = 0
     if audio_only:
-        if not any(s.get('codec_type') == 'audio' for s in media.get('streams', [])):
-            raise RuntimeError('Arquivo sem video ou audio reproduzivel.')
-        try:
-            seconds = min(MAX_SECONDS, float(media['format']['duration']))
-        except (KeyError, ValueError, TypeError):
+        if seconds <= 0:
             raise RuntimeError('Duracao da musica indisponivel.')
-        if not 0 < seconds <= MAX_SECONDS:
-            raise RuntimeError('Musica vazia ou acima do limite de 5 minutos.')
-        palette = PALETTE
-        count = min(fps * MAX_SECONDS, max(1, int(seconds * fps)))
-        bg = b'f' * (width * height)
-        with (folder / 'frames.bin').open('wb') as dst:
-            for i in range(count):
-                if cancel.is_set():
-                    raise RuntimeError('Conversao cancelada.')
-                frame = bytearray(bg)
-                for bar in range(4, width - 4, max(2, width // 36)):
-                    phase = (bar * 13 + i * 7) % 29
-                    magnitude = max(2, (height // 2) * (8 + abs(phase - 14)) // 22)
-                    for y in range(max(2, height // 2 - magnitude), min(height - 2, height // 2 + magnitude)):
-                        frame[y * width + bar] = ord('b' if y < height // 2 else '9')
-                dst.write(frame)
+        count, palette = render_audio_frames(source, width, height, fps, folder, cancel, seconds)
     else:
-        palette = sampled_palette(source, width, height)
-        cc_palette = make_palette(palette)
-        count = 0
-        frame_size = width * height * 3
-        cmd = ['ffmpeg', '-v', 'error', '-i', str(source), '-t', str(MAX_SECONDS),
+        try:
+            palette = sampled_palette(source, width, height)
+            cc_palette = make_palette(palette)
+            count = 0
+            frame_size = width * height * 3
+            cmd = ['ffmpeg', '-v', 'error', '-i', str(source), '-t', str(MAX_SECONDS),
            '-vf', video_filter(width, height, fps),
            '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-an', '-']
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            with (folder / 'frames.bin').open('wb') as dst:
-                while count < fps * MAX_SECONDS:
-                    if cancel.is_set():
-                        proc.terminate()
-                        break
-                    frame = proc.stdout.read(frame_size)
-                    if len(frame) != frame_size:
-                        break
-                    img = Image.frombytes('RGB', (width, height), frame)
-                    quant = img.quantize(palette=cc_palette, dither=Image.Dither.FLOYDSTEINBERG)
-                    dst.write(bytes(HEX[min(i, 15)] for i in quant.tobytes()))
-                    count += 1
-        finally:
-            proc.stdout.close()
-            proc.wait(timeout=20)
-        if cancel.is_set():
-            raise RuntimeError('Conversao cancelada.')
-        if proc.returncode != 0 or count == 0:
-            raise RuntimeError('FFmpeg nao conseguiu converter o video.')
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                with (folder / 'frames.bin').open('wb') as dst:
+                    while count < fps * MAX_SECONDS:
+                        if cancel.is_set():
+                            proc.terminate()
+                            break
+                        frame = proc.stdout.read(frame_size)
+                        if len(frame) != frame_size:
+                            break
+                        img = Image.frombytes('RGB', (width, height), frame)
+                        quant = img.quantize(palette=cc_palette, dither=Image.Dither.FLOYDSTEINBERG)
+                        dst.write(bytes(HEX[min(i, 15)] for i in quant.tobytes()))
+                        count += 1
+            finally:
+                proc.stdout.close()
+                proc.wait(timeout=20)
+            if cancel.is_set():
+                raise RuntimeError('Conversao cancelada.')
+            if proc.returncode != 0 or count == 0:
+                raise RuntimeError('FFmpeg nao conseguiu converter o video.')
+        except Exception as ex:
+            if cancel.is_set() or not has_audio or seconds <= 0:
+                raise
+            print('Imagem indisponivel; reproduzindo somente audio: ' + str(ex), flush=True)
+            fallback_visual = True
+            count, palette = render_audio_frames(source, width, height, fps, folder, cancel, seconds)
     audio = folder / 'audio.dfpwm'
     if cancel.is_set():
         raise RuntimeError('Conversao cancelada.')
@@ -222,6 +253,8 @@ def convert(url, width, height, fps, folder, cancel):
              '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'dfpwm', '-f', 'dfpwm', str(audio)], timeout=240)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         audio.unlink(missing_ok=True)
+    if fallback_visual and not audio.exists():
+        raise RuntimeError('Nao foi possivel converter o audio desta musica.')
     source.unlink(missing_ok=True)
     return count, audio.exists(), ['#%02x%02x%02x' % rgb for rgb in palette], title
 
@@ -310,6 +343,18 @@ def get_status(request: Request):
     require_auth(request)
     with lock:
         return {k: v for k, v in job.items() if k != 'generation'}
+
+
+@app.post('/metadata')
+async def get_metadata(request: Request):
+    require_auth(request)
+    try:
+        data = await request.json()
+        url = await asyncio.to_thread(validated_url, data['url'])
+    except (ValueError, KeyError, TypeError) as ex:
+        raise HTTPException(400, detail=str(ex)) from ex
+    title = await asyncio.to_thread(lookup_title, url)
+    return {'title': title or 'Título indisponível'}
 
 
 @app.post('/start')
@@ -440,13 +485,18 @@ async def websocket_endpoint(websocket: WebSocket):
             if not isinstance(data, dict):
                 continue
             if is_tv and data.get('type') == 'state':
+                queue = data.get('queue', [])
+                if not isinstance(queue, list):
+                    queue = []
                 last_tv_state = {
                     'type': 'state', 'online': True,
                     'playing': bool(data.get('playing')),
                     'paused': bool(data.get('paused')),
                     'status': str(data.get('status', ''))[:100],
                     'title': str(data.get('title', ''))[:120],
-                    'url': str(data.get('url', ''))[:1900],
+                    'queue': [str(title)[:120] for title in queue[:100]],
+                    'selected': data.get('selected') if isinstance(data.get('selected'), int) else 0,
+                    'current': data.get('current') if isinstance(data.get('current'), int) else 0,
                     'progress': max(0, min(300, float(data.get('progress') or 0))),
                     'duration': max(0, min(300, float(data.get('duration') or 0))),
                     'volume': max(0, min(3, float(data.get('volume') or 0))),
@@ -458,7 +508,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     item[1].set_result(bool(data.get('ok')))
             elif is_browser and data.get('type') == 'control':
                 action = data.get('action')
-                if action not in ('play', 'pause', 'resume', 'stop', 'next', 'volume', 'add_url'):
+                if action not in ('play', 'pause', 'resume', 'stop', 'next', 'volume', 'add_url', 'play_index'):
                     continue
                 try:
                     value = max(0, min(3, float(data.get('value', 0)))) if action == 'volume' else None
@@ -470,6 +520,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     except ValueError as ex:
                         await websocket.send_json({'type': 'add_result', 'ok': False, 'message': str(ex)})
                         continue
+                    title = await asyncio.to_thread(lookup_title, value)
+                    value = {'url': value, 'title': title or 'Título indisponível'}
+                elif action == 'play_index':
+                    raw = data.get('value')
+                    if not isinstance(raw, int) or not 1 <= raw <= len(last_tv_state.get('queue', [])):
+                        continue
+                    value = raw
                 if tv_socket:
                     try:
                         if action == 'add_url':

@@ -78,6 +78,9 @@ if cfg then cfg.write(textutils.serializeJSON({server=server,token=token}));cfg.
 
 local playlistFile = 'tv_playlist.json'
 local playlist = {}
+local function entry(url, title)
+  return {url=url, title=(type(title)=='string' and title~='' and title:sub(1,120)) or 'Titulo pendente'}
+end
 if fs.exists(playlistFile) then
   local f = fs.open(playlistFile, 'r')
   if f then
@@ -85,7 +88,11 @@ if fs.exists(playlistFile) then
     f.close()
     if type(saved) == 'table' then
       for _, item in ipairs(saved) do
-        if type(item) == 'string' and #item < 1900 then playlist[#playlist+1] = item end
+        if type(item) == 'string' and #item < 1900 then
+          playlist[#playlist+1] = entry(item)
+        elseif type(item)=='table' and type(item.url)=='string' and #item.url<1900 then
+          playlist[#playlist+1] = entry(item.url,item.title)
+        end
       end
     end
   end
@@ -96,11 +103,11 @@ local function save()
   f.write(textutils.serializeJSON(playlist)); f.close()
   return true
 end
-if initialURL and initialURL ~= '' then playlist[#playlist+1] = initialURL; save() end
+if initialURL and initialURL ~= '' then playlist[#playlist+1] = entry(initialURL); save() end
 local selected = initialURL and #playlist or 1
 local scroll = 0
 local state = {volume=1, status='Pronto', playing=false, abort=false,
-               intent=nil, quit=false, modal=false, current=nil, paused=false, progress=0, duration=0, title='', url=''}
+               intent=nil, quit=false, modal=false, current=nil, paused=false, progress=0, duration=0, title=''}
 local speakers = {peripheral.find('speaker')}
 local buttons = {}
 local function row(y, label, bg, fg)
@@ -135,10 +142,10 @@ local function draw()
   buttons = {}
   row(1, ' CC TV  |  Monitor: '..width..'x'..height..'  '..fps..' FPS', colors.blue, colors.white)
   row(2, (' %s  |  Volume %d%%'):format(state.status, math.floor(state.volume*100+0.5)), colors.black, colors.lime)
-  row(3, (' Lista (%d videos) - clique ou use as setas'):format(#playlist), colors.lightGray, colors.black)
+  row(3, (' Fila (%d itens) - clique ou use as setas'):format(#playlist), colors.lightGray, colors.black)
   for y=4,last do
     local index = scroll + y-3
-    local label = playlist[index] and (('%d. %s'):format(index, playlist[index])) or ''
+    local label = playlist[index] and (('%d. %s'):format(index, playlist[index].title)) or ''
     if index == state.current then label = '> '..label end
     row(y, label, index==selected and colors.cyan or colors.black,
         index==selected and colors.black or colors.white)
@@ -172,10 +179,9 @@ local function playOne(index)
   state.paused = false
   state.progress = 0
   state.duration = 0
-  state.url = playlist[index]
-  state.title = 'Video '..index
+  state.title = playlist[index].title
   status('Preparando video '..index..'...')
-  jsonResponse(request('/start', {url=playlist[index], width=width, height=height, fps=fps}))
+  jsonResponse(request('/start', {url=playlist[index].url, width=width, height=height, fps=fps}))
   local info
   repeat
     if state.abort then return false end
@@ -187,6 +193,11 @@ local function playOne(index)
   if state.abort then return false end
   state.duration = info.frames / info.fps
   state.title = info.title or state.title
+  if info.title and info.title~='' and playlist[index] then
+    playlist[index].title=info.title:sub(1,120)
+    save()
+    draw()
+  end
   if info.palette then
     for i=1,16 do monitor.setPaletteColor(2^(i-1), tonumber(info.palette[i]:sub(2),16)) end
   end
@@ -268,14 +279,15 @@ local function control(action, value)
     local value=read()
     state.modal=false
     if value and value:match('^https?://') then
-      playlist[#playlist+1]=value
+      playlist[#playlist+1]=entry(value)
       selected=#playlist
       save()
       status('Video adicionado a lista')
     else status('Link invalido ou vazio') end
   elseif action=='add_url' then
-    if type(value)=='string' and #value<=1900 and value:match('^https?://[%w%.%-]+') then
-      playlist[#playlist+1]=value
+    if type(value)=='table' and type(value.url)=='string' and #value.url<=1900
+        and value.url:match('^https?://[%w%.%-]+') then
+      playlist[#playlist+1]=entry(value.url,value.title)
       selected=#playlist
       if save() then
         status('Musica adicionada a lista')
@@ -296,6 +308,11 @@ local function control(action, value)
     if #playlist>0 then
       state.intent=selected; state.abort=true
       status('Abrindo video '..selected..'...')
+    end
+  elseif action=='play_index' then
+    if type(value)=='number' and value==math.floor(value) and value>=1 and value<=#playlist then
+      selected=value
+      control('play')
     end
   elseif action=='stop' then
     state.intent=nil; state.abort=true; state.paused=false
@@ -367,7 +384,7 @@ local function playbackLoop()
       state.playing=false
       state.paused=false
       state.current=nil
-      state.progress=0; state.duration=0; state.url=''; state.title=''
+      state.progress=0; state.duration=0; state.title=''
       if not ok and state.abort then status('Parado')
       elseif not ok then status('Erro: '..tostring(finished))
       elseif not state.abort and finished and not state.intent then
@@ -382,14 +399,35 @@ local function playbackLoop()
     else sleep(0.1) end
   end
 end
+local function metadataLoop()
+  while not state.quit do
+    if state.playing then sleep(2) else
+    local target=nil
+    for _,item in ipairs(playlist) do
+      if item.title=='Titulo pendente' then target=item;break end
+    end
+    if target then
+      local ok,info=pcall(function() return jsonResponse(request('/metadata',{url=target.url})) end)
+      if not state.quit then
+        target.title=(ok and type(info.title)=='string' and info.title or 'Titulo indisponivel'):sub(1,120)
+        save();draw()
+      end
+      sleep(5)
+    else sleep(2) end
+    end
+  end
+end
 local function remoteLoop()
   local wsURL=server:gsub('^http','ws')..'/ws'
   while not state.quit do
     local ok,ws=pcall(function() return http.websocket({url=wsURL,headers=headers,timeout=10}) end)
     if ok and ws then
       while not state.quit do
+        local titles={}
+        for i,item in ipairs(playlist) do titles[i]=item.title end
         local packet=textutils.serializeJSON({type='state',playing=state.playing,
-          paused=state.paused,status=state.status,title=state.title,url=state.url,
+          paused=state.paused,status=state.status,title=state.title,
+          queue=titles,selected=selected,current=state.current or 0,
           progress=state.progress,duration=state.duration,volume=state.volume})
         if not pcall(ws.send,packet) then break end
         local message,reason=ws.receive(1)
@@ -413,7 +451,7 @@ local function remoteLoop()
 end
 local original={}
 for i=1,16 do original[i]={monitor.getPaletteColor(2^(i-1))} end
-local ok,err=pcall(function() parallel.waitForAll(inputLoop,playbackLoop,remoteLoop) end)
+local ok,err=pcall(function() parallel.waitForAll(inputLoop,playbackLoop,remoteLoop,metadataLoop) end)
 stopSpeakers()
 for i,rgb in ipairs(original) do monitor.setPaletteColor(2^(i-1),table.unpack(rgb)) end
 monitor.setBackgroundColor(colors.black);monitor.clear()
