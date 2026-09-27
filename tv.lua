@@ -34,15 +34,28 @@ local function jsonResponse(handle)
   return data
 end
 local function request(path, body, binary)
-  local h, err
+  local h, err, errorHandle
   if body then
-    h, err = http.post(server .. path, textutils.serializeJSON(body), {['Content-Type']='application/json', ['Authorization']=headers.Authorization, ['ngrok-skip-browser-warning']='1'})
+    h, err, errorHandle = http.post(server .. path, textutils.serializeJSON(body),
+      {['Content-Type']='application/json', ['Authorization']=headers.Authorization,
+       ['ngrok-skip-browser-warning']='1'})
   else
-    h, err = http.get(server .. path, headers, binary)
+    h, err, errorHandle = http.get(server .. path, headers, binary)
   end
-  if not h then error('Servidor inacessivel: ' .. tostring(err) .. ' | ' .. server, 0) end
+  if not h then
+    if errorHandle then
+      local code = errorHandle.getResponseCode()
+      local detail = errorHandle.readAll()
+      errorHandle.close()
+      local parsed = textutils.unserializeJSON(detail)
+      error(('HTTP %d: %s'):format(code, (parsed and parsed.error) or detail:sub(1, 180)), 0)
+    end
+    error('Falha de conexao: ' .. tostring(err) .. ' | ' .. server, 0)
+  end
   return h
 end
+local check = jsonResponse(request('/status'))
+print('Conectado ao servidor. Estado: ' .. tostring(check.state))
 local result = jsonResponse(request('/start', {url=url, width=width, height=height, fps=fps}))
 print('Preparando video no PC...')
 local status
